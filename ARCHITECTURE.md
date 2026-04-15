@@ -12,12 +12,12 @@ This document explains the internal design of the LinkedIn → Substack Agent in
           │  LinkedIn URL             │                              │
           │  (or pasted text)         │                              │
           ├──────────────────────────►│                              │
-          │                           │── scrape_post(url) ────────►│ Playwright
-          │                           │◄── { text, images[] } ──────│ + Chromium
+          │                           │── scrape_post(url) ────────► │Playwright
+          │                           │◄── { text, images[] } ────── │+ Chromium
           │                           │                              │
-          │                           │── rewrite(text, tone) ─────►│ Mistral API
-          │                           │◄── { title, subtitle,       │ (JSON mode)
-          │                           │     sections[] } ───────────│
+          │                           │── rewrite(text, tone) ─────► │Mistral API
+          │                           │◄── { title, subtitle,        │(JSON mode)
+          │                           │      sections[] } ───────────│
           │                           │                              │
           │◄── generated draft ───────│                              │
           │                           │                              │
@@ -27,24 +27,24 @@ This document explains the internal design of the LinkedIn → Substack Agent in
     ║  • edit title /        ║        │                              │
     ║    subtitle / body     ║        │                              │
     ║  • live preview        ║        │                              │
-    ║  • regenerate with     ║────────┼─── rewrite() ──────────────►│ Mistral API
+    ║  • regenerate with     ║────────┼─── rewrite() ──────────────► │Mistral API
     ║    new instructions    ║        │◄───────────────────────── ───│ (if regen)
-    ║  • explicit approve ✓  ║        │                              │
+    ║  • explicit approve ✓  ║        │                              |
     ╚═════╤══════════════════╝        │                              │
           │                           │                              │
           │  "Approve & Publish"      │                              │
           ├──────────────────────────►│                              │
-          │                           │── download(img_url) ───────►│ LinkedIn CDN
-          │                           │◄── tmp_file ────────────────│
-          │                           │── upload_image(tmp) ───────►│ Substack CDN
-          │                           │◄── cdn_url ─────────────────│
+          │                           │── download(img_url) ───────► │LinkedIn CDN
+          │                           │◄── tmp_file ──────────────── │
+          │                           │── upload_image(tmp) ───────► │Substack CDN
+          │                           │◄── cdn_url ───────────────── │
           │                           │                              │
-          │                           │── POST /api/v1/drafts ─────►│
-          │                           │── GET  prepublish ─────────►│ Substack
-          │                           │── POST publish ────────────►│ internal API
-          │                           │◄── canonical_url ───────────│
+          │                           │── POST /api/v1/drafts ─────► │
+          │                           │── GET  prepublish ─────────► │Substack
+          │                           │── POST publish ────────────► │internal API
+          │                           │◄── canonical_url ─────────── │
           │                           │                              │
-          │                           │── send_confirmation() ─────►│ Gmail SMTP
+          │                           │── send_confirmation() ─────► │Gmail SMTP
           │◄── live Substack URL ─────│                              │
           │                           │                              │
 ```
