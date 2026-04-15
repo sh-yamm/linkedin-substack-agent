@@ -4,6 +4,55 @@ This document explains the internal design of the LinkedIn → Substack Agent in
 
 ---
 
+## Agent Workflow
+
+```
+        USER                        AGENT                          TOOLS
+          │                           │                              │
+          │  LinkedIn URL             │                              │
+          │  (or pasted text)         │                              │
+          ├──────────────────────────►│                              │
+          │                           │── scrape_post(url) ────────►│ Playwright
+          │                           │◄── { text, images[] } ──────│ + Chromium
+          │                           │                              │
+          │                           │── rewrite(text, tone) ─────►│ Mistral API
+          │                           │◄── { title, subtitle,       │ (JSON mode)
+          │                           │     sections[] } ───────────│
+          │                           │                              │
+          │◄── generated draft ───────│                              │
+          │                           │                              │
+    ╔═════╧══════════════════╗        │                              │
+    ║   HUMAN IN THE LOOP    ║        │                              │
+    ║  ──────────────────    ║        │                              │
+    ║  • edit title /        ║        │                              │
+    ║    subtitle / body     ║        │                              │
+    ║  • live preview        ║        │                              │
+    ║  • regenerate with     ║────────┼─── rewrite() ──────────────►│ Mistral API
+    ║    new instructions    ║        │◄───────────────────────── ───│ (if regen)
+    ║  • explicit approve ✓  ║        │                              │
+    ╚═════╤══════════════════╝        │                              │
+          │                           │                              │
+          │  "Approve & Publish"      │                              │
+          ├──────────────────────────►│                              │
+          │                           │── download(img_url) ───────►│ LinkedIn CDN
+          │                           │◄── tmp_file ────────────────│
+          │                           │── upload_image(tmp) ───────►│ Substack CDN
+          │                           │◄── cdn_url ─────────────────│
+          │                           │                              │
+          │                           │── POST /api/v1/drafts ─────►│
+          │                           │── GET  prepublish ─────────►│ Substack
+          │                           │── POST publish ────────────►│ internal API
+          │                           │◄── canonical_url ───────────│
+          │                           │                              │
+          │                           │── send_confirmation() ─────►│ Gmail SMTP
+          │◄── live Substack URL ─────│                              │
+          │                           │                              │
+```
+
+**Key design principle:** The agent acts, then stops. It does not publish autonomously. The human reviews and explicitly approves before any external state changes — no post is created, no image is uploaded, nothing touches Substack until Step 4.
+
+---
+
 ## System Overview
 
 The application is a 5-step pipeline with a deliberate pause at step 3 for human review. Each step produces output that feeds the next. The UI layer is thin — all business logic lives in the agents and tools.
@@ -167,8 +216,8 @@ LinkedIn Post URL (optional)
            │ Step 4: publish pipeline
            ▼
   ┌──────────────────┐  GET (Referer: linkedin.com)  ┌──────────────┐
-  │  ImageHandler    │──────────────────────────────►│  LinkedIn CDN │
-  │  .download()     │◄── raw bytes → tmp file ───────│              │
+  │  ImageHandler    │──────────────────────────────►│  LinkedIn CDN│
+  │  .download()     │◄── raw bytes → tmp file ──────│              │
   └────────┬─────────┘                               └──────────────┘
            │ tmp file path
            ▼

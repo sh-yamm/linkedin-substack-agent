@@ -225,7 +225,7 @@ Substack's official Developer API (launched 2025) is read-only — it returns pu
 
 ---
 
-#### How We Found the Endpoints
+#### How I Found the Endpoints
 
 1. Logged into Substack in Chrome, opened the post editor
 2. Opened DevTools → Network tab → filtered by `api/v1`
@@ -263,7 +263,7 @@ Publishing a post requires these 3 API calls in exact order:
    Response: { slug: "post-title", canonical_url: "https://..." }
 ```
 
-The `prepublish` step was not obvious — there is no documentation for it anywhere. We only discovered it by watching the network tab during a manual publish. Without it, the publish silently fails or returns incorrect settings.
+The `prepublish` step was not obvious — there is no documentation for it anywhere. I only discovered it by watching the network tab during a manual publish. Without it, the publish silently fails or returns incorrect settings.
 
 ---
 
@@ -569,6 +569,4 @@ venv/Scripts/python -m playwright install chromium
 
 - All credentials live in `.env` which is gitignored — never committed to the repo
 - `session.json` contains LinkedIn session cookies — gitignored, treat like a password, never commit
-- Substack session cookies should be treated like passwords — rotate after the demo
 - Gmail App Password can be revoked from Google Account settings at any time
-- Mistral API key should be regenerated after the demo
