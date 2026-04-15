@@ -24,10 +24,10 @@ An agentic application that takes a LinkedIn post, rewrites it into a well-forma
 
 ```
 ┌─────────────────────────────────────────────────┐
-│              Streamlit UI (app.py)               │
+│              Streamlit UI (app.py)              │
 │  Step 1: Ingest → Step 2: Configure →           │
 │  Step 3: Review [HITL] → Step 4: Publish →      │
-│  Step 5: Done                                    │
+│  Step 5: Done                                   │
 └────────────┬──────────────────┬─────────────────┘
              │                  │
              ▼                  ▼
