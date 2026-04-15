@@ -34,6 +34,171 @@ Live Substack URL returned to user
 
 ---
 
+## State Machine & Data Flow
+
+> **Note:** This app does not use LangGraph or any agent orchestration framework. The "agentic" flow is implemented as a hand-rolled Streamlit state machine controlled by `st.session_state.step` (integer 1–5). Each step is a discrete render function; transitions happen via `go_to(n)` + `st.rerun()`.
+
+---
+
+### Step Transition Diagram
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  st.session_state.step transitions — all navigation is explicit      │
+└──────────────────────────────────────────────────────────────────────┘
+
+  ┌───────────────────────────┐
+  │      STEP 1: INGEST       │ ◄─────────────────────────── "Start Over"
+  │  • URL scrape (optional)  │                                   │
+  │  • Manual paste fallback  │                                   │
+  │  Writes: linkedin_text,   │                              (resets all
+  │          image_urls       │                            session_state)
+  └─────────────┬─────────────┘
+                │ "Next →"
+                ▼
+  ┌───────────────────────────┐
+  │    STEP 2: CONFIGURE      │ ◄── "← Back" ──┐
+  │  • Choose tone            │                │
+  │  • Optional edit instrs.  │                │
+  │  • Calls ContentAgent     │                │
+  │  Writes: tone,            │                │
+  │    generated_title,       │                │
+  │    generated_subtitle,    │                │
+  │    generated_sections     │                │
+  └─────────────┬─────────────┘                │
+                │ "Generate Draft →"            │
+                ▼                               │
+  ┌───────────────────────────┐                 │
+  │   STEP 3: REVIEW (HITL)   │ ◄──── "← Back" ─┤
+  │  • Edit title/subtitle    │                 │
+  │  • Edit body text         │◄──┐             │
+  │  • Live preview (iframe)  │   │ "Regenerate"│
+  │  • Optional Regen call    │───┘ (self-loop) │
+  │  Writes: generated_*      │                 │
+  └─────────────┬─────────────┘                 │
+                │ "Approve & Publish →"          │
+                ▼                               │
+  ┌───────────────────────────┐                 │
+  │    STEP 4: PUBLISH        │ ◄── "← Back" ──┘
+  │  • Confirm email address  │
+  │  • ImageHandler: download │
+  │  • SubstackClient: upload,│
+  │    draft, prepublish,     │
+  │    publish                │
+  │  • EmailSender: confirm   │
+  │  Writes: published_url    │
+  └─────────────┬─────────────┘
+                │ "Confirm & Publish →"
+                ▼
+  ┌───────────────────────────┐
+  │      STEP 5: DONE         │
+  │  • Show live URL          │
+  │  • Email sent             │
+  └─────────────┬─────────────┘
+                │ "Start Over"
+                └──────────────► reset all state → Step 1
+```
+
+---
+
+### Session State Keys Per Step
+
+| Key | Written by | Read by |
+|---|---|---|
+| `linkedin_text` | Step 1 | Step 2 (→ ContentAgent), Step 3 (Regen) |
+| `image_urls` | Step 1 | Step 3 (preview), Step 4 (image transfer) |
+| `tone` | Step 2 | Step 3 (Regen default) |
+| `edit_mode` / `edit_instructions` | Step 2 | Step 3 (Regen) |
+| `generated_title` | Step 2, Step 3 | Step 3 (edit field), Step 4 (publish) |
+| `generated_subtitle` | Step 2, Step 3 | Step 3 (edit field), Step 4 (publish) |
+| `generated_sections` | Step 2, Step 3 | Step 3 (edit area), Step 4 (publish) |
+| `preview_image_data_uris` | Step 3 (`_image_data_uri` cache) | Step 3 (iframe preview) |
+| `user_email` | Step 4 | Step 5 (display) |
+| `published_url` | Step 4 | Step 5 (display) |
+| `publish_error` | Step 4 | Step 4 (error display) |
+
+---
+
+### Full Data Flow Diagram
+
+```
+LinkedIn Post URL (optional)
+         │
+         ▼
+  ┌──────────────────┐  scrape_post(url)   ┌─────────────────────┐
+  │ linkedin_scraper │────────────────────►│  Chromium (headless  │
+  │                  │◄─{text, images[]}───│  =False, Playwright) │
+  └────────┬─────────┘                     └─────────────────────┘
+           │ or manual paste
+           │
+           ▼
+   linkedin_text (str)
+   image_urls (str, newline-sep)
+           │
+           │ Step 2: ContentAgent.rewrite()
+           ▼
+  ┌──────────────────┐  prompt (text+tone) ┌─────────────────────┐
+  │  ContentAgent    │────────────────────►│   Mistral API        │
+  │                  │◄─JSON {title,       │   (mistral-small-    │
+  └────────┬─────────┘   subtitle,         │    latest,           │
+           │             sections[]}       │    json_object mode) │
+           │                               └─────────────────────┘
+           ▼
+   generated_title (str)
+   generated_subtitle (str)
+   generated_sections (list[dict])
+           │
+           │  ◄──────────── HUMAN EDITS HERE (Step 3) ───────────────►
+           │  title/subtitle/body editable in text inputs + text_area
+           │  sections ↔ plain text serialised via sections_to_text()
+           │                          / text_to_sections()
+           │
+           ├──► Step 3 preview: image_urls
+           │          │
+           │          ▼
+           │   ┌──────────────────┐  GET (Referer: linkedin.com)  ┌──────────────┐
+           │   │  ImageHandler    │──────────────────────────────►│  LinkedIn CDN │
+           │   │  .download()     │◄── raw bytes ─────────────────│              │
+           │   └────────┬─────────┘                               └──────────────┘
+           │            │ base64 data URI → cached in preview_image_data_uris
+           │            ▼
+           │   <img src="data:image/jpeg;base64,..."/>  (embedded in iframe)
+           │
+           │ Step 4: publish pipeline
+           ▼
+  ┌──────────────────┐  GET (Referer: linkedin.com)  ┌──────────────┐
+  │  ImageHandler    │──────────────────────────────►│  LinkedIn CDN │
+  │  .download()     │◄── raw bytes → tmp file ───────│              │
+  └────────┬─────────┘                               └──────────────┘
+           │ tmp file path
+           ▼
+  ┌──────────────────┐  POST /api/v1/image            ┌──────────────┐
+  │  SubstackClient  │  data={image: base64 data URI}►│  Substack    │
+  │  .upload_image() │◄── {url: s3_url} ──────────────│  CDN (S3)    │
+  └────────┬─────────┘                                └──────────────┘
+           │ cdn_url = substackcdn.com/image/fetch/.../{encoded_s3_url}
+           │
+           ▼
+  ┌──────────────────┐  POST /api/v1/drafts            ┌──────────────┐
+  │  SubstackClient  │  {title, subtitle,              │  Substack    │
+  │  ._create_draft()│  draft_body: ProseMirror JSON}►│  private API │
+  │  ._prepublish()  │  GET  /api/v1/drafts/{id}/      │              │
+  │  ._publish_draft │       prepublish                │              │
+  │                  │  POST /api/v1/drafts/{id}/      │              │
+  │                  │       publish                  ►│              │
+  └────────┬─────────┘◄── {slug, canonical_url} ───────└──────────────┘
+           │
+           │ published_url
+           ▼
+  ┌──────────────────┐  SMTP SSL port 465              ┌──────────────┐
+  │  EmailSender     │────────────────────────────────►│  Gmail SMTP  │
+  │  .send_          │  HTML + plain-text multipart    │              │
+  │  confirmation()  │                                 └──────────────┘
+  └──────────────────┘
+```
+
+---
+
 ## Component Breakdown
 
 ### `app.py` — UI State Machine
@@ -178,15 +343,21 @@ body = {
             "content": [{"type": "text", "text": "Paragraph content here."}]
         },
         {
-            "type": "captionedImage",
-            "attrs": {
-                "src": "https://substackcdn.com/...",
-                "fullscreen": False,
-                "imageSize": "normal",
-                "resizeWidth": 728,
-                ...
-            }
+            "type": "paragraph",
+            "content": [
+                {
+                    "type": "image",
+                    "attrs": {
+                        "src": "https://substackcdn.com/image/fetch/.../{encoded_s3}",
+                        "alt": None,
+                        "title": None,
+                    }
+                }
+            ]
         }
+        # NOTE: captionedImage is Substack's editor-only node type.
+        # It is stored in the draft but ignored by the server-side HTML renderer.
+        # Only "image" inside a "paragraph" renders in the published post.
     ]
 }
 
@@ -226,13 +397,24 @@ This 1-second delay between calls is deliberate and conservative:
 #### Image Upload
 
 ```python
-# Upload local file to Substack CDN
+# Upload local file to Substack CDN — base64 form-encoded, NOT multipart
 with open(image_path, "rb") as f:
-    resp = self.session.post(f"{self.base_url}/api/v1/image", files={"image": f})
-cdn_url = resp.json()["url"]  # → https://substackcdn.com/image/fetch/...
+    raw_bytes = f.read()
+encoded = base64.b64encode(raw_bytes)
+data_uri = b"data:" + mime_type.encode() + b";base64," + encoded
+resp = self.session.post(f"{self.base_url}/api/v1/image", data={"image": data_uri})
+s3_url = resp.json()["url"]
+cdn_url = _to_cdn_url(s3_url)  # → https://substackcdn.com/image/fetch/.../{encoded_s3}
 ```
 
-The `Content-Type` header is omitted for this call — `requests` sets it to `multipart/form-data` automatically when `files=` is used, which is what Substack's endpoint expects.
+**Critical format detail:** Substack's image endpoint expects `application/x-www-form-urlencoded` with the image as a base64 data URI string — NOT `multipart/form-data`. Using `files={"image": f}` (the natural `requests` approach) returns a `400 Invalid value`. This was discovered by reading the source code of the open-source `python-substack` library.
+
+After upload, the raw S3 URL must be wrapped in a Substack CDN proxy URL for Substack's renderer to serve it correctly:
+```python
+def _to_cdn_url(s3_url: str) -> str:
+    encoded = quote(s3_url, safe="")
+    return f"https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/{encoded}"
+```
 
 Images that fail to upload are skipped with a warning. Publishing is not blocked by image failures.
 

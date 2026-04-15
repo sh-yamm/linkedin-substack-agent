@@ -215,60 +215,214 @@ This avoids parsing markdown or HTML from the LLM output, which is unreliable. S
 
 ### Substack Publishing — Reverse-Engineered Internal API
 
-This is the most interesting engineering challenge in the project. Here is exactly how we arrived at the solution.
+This is the most technically challenging part of the project. Substack has **no public API for publishing**. Everything here was discovered by reading network traffic and open-source library source code.
 
-**The problem:**
-Substack has no public API for publishing posts. Their official Developer API (launched 2025) only returns public profile data and explicitly does not support programmatic publishing.
+---
 
-**How we reverse-engineered it:**
-1. Opened Substack's web editor in Chrome
-2. Opened DevTools → Network tab → filtered for `api/v1`
-3. Performed actions manually (create post, add content, publish) and observed every HTTP request
-4. Identified the internal REST endpoints Substack's own editor uses:
+#### The Problem
+
+Substack's official Developer API (launched 2025) is read-only — it returns public subscriber and post data but explicitly does not support creating or publishing posts. The only way to programmatically publish is to use the same internal REST endpoints that Substack's own web editor uses.
+
+---
+
+#### How We Found the Endpoints
+
+1. Logged into Substack in Chrome, opened the post editor
+2. Opened DevTools → Network tab → filtered by `api/v1`
+3. Performed every action manually: create draft, type content, upload an image, click Publish
+4. Captured every request: URL, method, headers, request body, response body
+
+This revealed the full internal API surface:
 
 ```
-POST  /api/v1/drafts                        ← create draft
-PUT   /api/v1/drafts/{id}                   ← update draft
-GET   /api/v1/drafts/{id}/prepublish        ← pre-publish validation
-POST  /api/v1/drafts/{id}/publish           ← publish
-POST  /api/v1/image                         ← upload image to CDN
-GET   /api/v1/user/profile/self             ← get user ID
+GET   /api/v1/user/profile/self             ← get logged-in user's numeric ID
+POST  /api/v1/drafts                        ← create a new draft
+GET   /api/v1/drafts/{id}/prepublish        ← pre-publish validation check
+POST  /api/v1/drafts/{id}/publish           ← publish the draft
+POST  /api/v1/image                         ← upload image, returns CDN URL
 ```
 
-5. Identified the authentication mechanism: session cookies (`substack.sid` and `substack.lli`) set when logged in via browser
-6. Identified the request body format for draft creation — critically, `draft_body` is **not plain HTML** but a stringified ProseMirror JSON document:
+---
+
+#### The 3-Step Publish Flow
+
+Publishing a post requires these 3 API calls in exact order:
+
+```
+1. POST /api/v1/drafts
+   Body: { draft_title, draft_subtitle, draft_body (ProseMirror JSON), draft_bylines, audience }
+   Response: { id: "12345" }
+
+2. GET /api/v1/drafts/12345/prepublish
+   Substack's own editor always calls this before enabling the Publish button.
+   It validates audience settings, section assignment, etc.
+   ⚠ Skipping this step causes the publish call to fail with a 400.
+
+3. POST /api/v1/drafts/12345/publish
+   Body: { send: false, share_automatically: false }
+   Response: { slug: "post-title", canonical_url: "https://..." }
+```
+
+The `prepublish` step was not obvious — there is no documentation for it anywhere. We only discovered it by watching the network tab during a manual publish. Without it, the publish silently fails or returns incorrect settings.
+
+---
+
+#### The `draft_body` Format — ProseMirror JSON
+
+The single most important implementation detail: `draft_body` is **not HTML**. It is a stringified ProseMirror document (Substack's editor is built on TipTap, which uses the ProseMirror schema).
+
 ```json
 {
   "type": "doc",
   "content": [
-    {"type": "heading", "attrs": {"level": 2}, "content": [{"type": "text", "text": "..."}]},
-    {"type": "paragraph", "content": [{"type": "text", "text": "..."}]}
+    {
+      "type": "heading",
+      "attrs": { "level": 2 },
+      "content": [{ "type": "text", "text": "Section Title" }]
+    },
+    {
+      "type": "paragraph",
+      "content": [{ "type": "text", "text": "Paragraph content here." }]
+    },
+    {
+      "type": "paragraph",
+      "content": [
+        {
+          "type": "image",
+          "attrs": { "src": "https://substackcdn.com/...", "alt": null, "title": null }
+        }
+      ]
+    }
   ]
 }
 ```
-7. Found that publishing requires a 3-step flow: `create_draft → prepublish → publish`. Skipping `prepublish` causes the publish to fail.
 
-**Rate limiting strategy:**
-We add a `time.sleep(1)` between every Substack API call. This is a deliberate, conservative choice:
-- Community research suggests Substack's internal API rate-limits aggressive clients at approximately 1 request/second
-- Our workflow makes exactly 5 API calls per publish (get_user_id → create_draft → prepublish → publish, + image upload per image)
-- At 1 second apart, the full publish flow takes ~5 seconds — imperceptible to the user, zero risk of rate-limiting or account flagging
-- This is nowhere near bulk automation; it's a single human-triggered action
+This entire object is then `json.dumps()`'d and sent as the string value of `draft_body` in the POST body — it is stringified JSON inside a JSON object.
 
-**Authentication:**
+---
+
+#### Authentication — Why the Raw Cookie Header
+
 Two session cookies are required:
-- `substack.sid` — the main session cookie, URL-encoded Connect.js format
+
+- `substack.sid` — main session, URL-encoded Connect.js session ID, format: `s%3A<id>.<signature>`
 - `substack.lli` — "likely logged in" JWT, short-lived presence indicator
 
-Both are sent as a raw `Cookie` header (not via the `requests` cookie jar) to avoid double-encoding the URL-encoded SID value. Cookie lifetime is approximately 30 days.
+**The problem with using `requests`' cookie jar:**
+`substack.sid` is already URL-encoded (contains `%3A`, `%2F`, etc.). The `requests` library's cookie jar decodes values before sending and then re-encodes them, which causes double-encoding — `%3A` becomes `%253A` — and Substack rejects the session as invalid.
 
-**Why not use the `python-substack` library:**
-The `ma2za/python-substack` library was evaluated but we chose to write direct HTTP calls instead because:
-- Full control over the exact request format and headers
-- No dependency on a library that may change or break
-- We already knew the exact endpoints from the reverse-engineering step
-- The library's authentication with Google OAuth accounts (no password) requires additional handling
-- Fewer moving parts = easier to debug
+**Fix:** Send as a raw `Cookie` header, bypassing the cookie jar entirely:
+
+```python
+self.session.headers.update({
+    "Cookie": f"substack.sid={config.SUBSTACK_SID}; substack.lli={config.SUBSTACK_LLI}"
+})
+```
+
+This sends the cookies exactly as copied from the browser — no re-encoding.
+
+---
+
+#### Image Pipeline — Three Problems, Three Fixes
+
+Getting images from a LinkedIn post into a published Substack post required solving three separate problems in sequence.
+
+**Problem 1 — LinkedIn CDN blocks direct access**
+
+LinkedIn's CDN serves images with authentication. Simply putting a LinkedIn image URL into a Substack post body would mean Substack's servers (and readers' browsers) would get a 403 when trying to load it.
+
+**Fix:** Download each image locally first, then re-upload to Substack's own CDN. The download requires a browser-like `Referer: https://www.linkedin.com/` header — without it, LinkedIn's CDN returns an HTML redirect instead of the image bytes.
+
+---
+
+**Problem 2 — Substack's image upload rejects standard multipart**
+
+The first implementation used `requests`' standard file upload:
+
+```python
+# WRONG — what we tried first:
+resp = session.post("/api/v1/image", files={"image": open(path, "rb")})
+# → 400 {"errors":[{"param":"image","msg":"Invalid value"}]}
+```
+
+This returned `400 Invalid value` every time, with no explanation of what format was expected. We tried different field names, MIME types, and filenames — all 400.
+
+After ruling out session issues and endpoint problems, we read the source code of the open-source `ma2za/python-substack` library on GitHub and found the actual format:
+
+```python
+# CORRECT — what Substack actually expects:
+encoded = base64.b64encode(open(path, "rb").read())
+data_uri = b"data:image/jpeg;base64," + encoded
+resp = session.post("/api/v1/image", data={"image": data_uri})
+# → 200 {"url": "https://bucketeer-....s3.amazonaws.com/..."}
+```
+
+Three things were wrong simultaneously: the encoding (raw binary vs. base64), the content type (multipart/form-data vs. form-urlencoded), and the value format (file object vs. data URI string). Substack's error message gives no hint about any of this.
+
+---
+
+**Problem 3 — Images stored in the draft but not rendering in the published post**
+
+After fixing the upload, images appeared in the Substack editor draft when we opened it manually — but were completely absent from the published post HTML.
+
+The first implementation used the `captionedImage` node type, which is what Substack's TipTap editor uses internally:
+
+```json
+{ "type": "captionedImage", "attrs": { "src": "...", "imageSize": "normal", ... } }
+```
+
+This node type is stored in the draft JSON correctly. But Substack's **server-side HTML renderer** — which runs when the post is published and generates the public-facing page — ignores `captionedImage` entirely. We confirmed this by fetching the published post's HTML and finding zero `captionedImage` references.
+
+**Fix:** Use a standard `image` node inside a `paragraph` wrapper:
+
+```json
+{
+  "type": "paragraph",
+  "content": [
+    { "type": "image", "attrs": { "src": "https://substackcdn.com/...", "alt": null } }
+  ]
+}
+```
+
+This is the node type Substack's renderer handles. Once switched, images rendered correctly in published posts.
+
+---
+
+**Problem 4 — Raw S3 URLs don't render**
+
+The upload response returns a raw S3 URL: `https://bucketeer-....s3.amazonaws.com/...`
+
+Using this URL directly in the post body resulted in broken images for readers (S3 bucket access restrictions). Substack's renderer expects CDN proxy URLs:
+
+```python
+def _to_cdn_url(s3_url):
+    encoded = urllib.parse.quote(s3_url, safe="")
+    return f"https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/{encoded}"
+```
+
+The CDN URL wraps the S3 URL as a URL-encoded path parameter, and Substack's CDN proxy serves it with correct caching, resizing, and access control.
+
+---
+
+#### Rate Limiting Strategy
+
+Every Substack API call is preceded by `time.sleep(1)`. This is deliberate:
+
+- Community testing suggests Substack throttles aggressive clients at ~1 req/sec
+- Our workflow makes 5 calls per publish: `get_user_id → create_draft → prepublish → publish` + 1 per image
+- At 1s apart, the full publish takes ~5–6 seconds — imperceptible to the user
+- A single human-triggered publish cannot be mistaken for bulk automation
+
+---
+
+#### Why Not Use the `python-substack` Library
+
+The `ma2za/python-substack` library was evaluated. We chose direct HTTP calls because:
+
+- The library uses the correct image upload format (this is how we discovered it) but its draft/publish flow doesn't match our ProseMirror body structure needs
+- It requires Google OAuth handling for accounts that log in with Google (no password available)
+- Direct HTTP gives full control over every header, cookie, and body field
+- Fewer moving parts = faster debugging when something breaks (and a lot broke)
 
 ---
 
@@ -323,9 +477,10 @@ Gradio was considered but its interface model is better suited to single-functio
 LinkedIn images cannot be embedded directly in Substack posts (cross-origin restrictions, LinkedIn CDN requires auth). The pipeline:
 
 1. Download image from LinkedIn URL to a local temp file (`requests` with browser `User-Agent` + `Referer: https://www.linkedin.com/`)
-2. Upload to Substack's CDN via `POST /api/v1/image` → returns a `substackcdn.com` URL
-3. Inject the Substack CDN URL into the ProseMirror document as a `captionedImage` node
-4. Delete the temp file
+2. Upload to Substack's CDN via `POST /api/v1/image` → returns a raw S3 URL
+3. Wrap the S3 URL into a `substackcdn.com/image/fetch/...` CDN proxy URL
+4. Inject the CDN URL into the ProseMirror document as an `image` node inside a `paragraph`
+5. Delete the temp file
 
 Images are transferred non-blockingly — if an image download or upload fails, a warning is shown but publishing continues with the remaining content.
 
@@ -352,16 +507,44 @@ The correct format was confirmed by reading the source of `ma2za/python-substack
 
 ## Known Limitations
 
+### Content Limitations
+
 | Limitation | Detail |
 |---|---|
-| LinkedIn scraping | Playwright-based; requires one-time `setup_session.py` run. Falls back to manual paste if session missing/expired. |
-| LinkedIn session expires | `session.json` expires in ~30 days. Re-run `setup_session.py` to refresh. |
-| LinkedIn DOM changes | LinkedIn changes CSS selectors periodically. Multiple fallback selectors are tried; worst case, manual paste is always available. |
-| Substack cookies expire | `substack.sid` / `substack.lli` expire in ~30 days. Refresh by copying new values from browser DevTools. |
-| Substack API stability | The internal API is undocumented and unsupported. Substack can change it without notice. |
-| Mistral free tier | Rate-limited. Sufficient for demos and prototyping; not for high-volume use. |
-| Image formats | Only JPEG, PNG, GIF, WebP supported. LinkedIn PDFs or video thumbnails are skipped. |
-| No draft saving | Content is lost if the browser tab closes before publishing. Session state is in-memory only. |
+| **No video support** | LinkedIn video posts cannot be included. Videos are not downloadable from LinkedIn's CDN without authentication, and Substack's internal API has no video upload endpoint accessible via this method. Video content in a LinkedIn post is silently skipped. |
+| **No carousel / document posts** | LinkedIn carousel posts (multi-slide PDFs) and document posts are not supported. The scraper extracts text from the post caption only — the slide content is not accessible in the page DOM without additional interaction. |
+| **No image captions** | Images are embedded in the published post without captions. Substack's `captionedImage` node (the only node that supports captions) is ignored by the server-side renderer. The `image` node we use does not accept a caption field. |
+| **Images only from LinkedIn CDN** | The scraper only collects images hosted on `media.licdn.com`. Externally linked images (e.g. images in a post that link to another site) are not captured. |
+| **No GIF animation** | Animated GIFs lose their animation. The image is downloaded as a static file and re-uploaded to Substack CDN, which may convert it to a static WebP. |
+| **No polls or reactions data** | LinkedIn poll results, emoji reactions, and engagement metrics are stripped from the post text by the scraper's noise filter. |
+
+### Publishing Limitations
+
+| Limitation | Detail |
+|---|---|
+| **Publishes immediately** | There is no scheduling support. Clicking Confirm & Publish makes the post live immediately. Substack's internal API has a schedule field but it is not wired up in this tool. |
+| **Always published to everyone** | Posts are published with `audience: "everyone"`. Paid-subscriber-only posts are not supported. |
+| **No email send** | `send: false` is hardcoded in the publish call. The post goes live on the Substack web page but is not sent as an email newsletter to subscribers. This is intentional to avoid spamming subscribers during testing. |
+| **One post at a time** | The pipeline processes one LinkedIn post per session. There is no batch or queue mode. |
+| **No draft persistence** | Generated content lives in Streamlit's in-memory session state. Closing the browser tab or refreshing the page loses all work. There is no save-draft-and-come-back flow. |
+
+### Credential and Session Limitations
+
+| Limitation | Detail |
+|---|---|
+| **LinkedIn session expires** | `session.json` typically expires in ~30 days. When it does, the scraper raises `ScraperError` and the UI falls back to manual paste. Re-run `setup_session.py` to refresh. |
+| **LinkedIn DOM changes** | LinkedIn changes their CSS class names with frontend deployments. The scraper tries 6 selectors in order and falls back to `<main>` text extraction. If all fail, manual paste is always available. |
+| **Substack cookies expire** | `substack.sid` and `substack.lli` expire in ~30 days. Refresh them by copying new values from browser DevTools → Application → Cookies → substack.com. |
+| **Substack API is undocumented** | The internal `/api/v1` endpoints are not public, not versioned, and can change without notice. Any Substack frontend update could break the publish flow. |
+| **Scraping respects account visibility** | The scraper only sees posts that your logged-in LinkedIn account can see. Posts from accounts you don't follow (if set to followers-only) will load a restricted view with no post text. |
+
+### Infrastructure Limitations
+
+| Limitation | Detail |
+|---|---|
+| **Windows only (as-is)** | The asyncio ProactorEventLoop fix in `linkedin_scraper.py` is Windows-specific. On Linux/macOS, this line is skipped and Playwright uses its default event loop — this should work fine but has not been tested. |
+| **Localhost only** | Playwright's visible browser (`headless=False`) requires a display. This prevents deployment to headless cloud environments (Streamlit Community Cloud, Heroku, etc.) without additional Xvfb configuration. |
+| **Mistral free tier rate limits** | Mistral's free tier is rate-limited. Rapid successive generation/regeneration calls may return `503 unreachable_backend`. Wait a few seconds and retry. |
 
 ---
 
