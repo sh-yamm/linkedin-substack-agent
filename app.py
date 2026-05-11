@@ -28,6 +28,7 @@ DEFAULTS = {
     "generated_title": "",
     "generated_subtitle": "",
     "generated_sections": [],
+    "image_descriptions": [],        # [{index, url, description}] from Pixtral
     "preview_image_data_uris": {},   # {url: "data:image/jpeg;base64,..."} cache
     "published_url": "",
     "user_email": "",
@@ -44,12 +45,16 @@ def go_to(step: int):
 
 
 def sections_to_text(sections: list) -> str:
-    """Render sections as editable plain text (## prefix for headings)."""
+    """Render sections as editable plain text.
+    Headings use ## prefix. Image placements render as [IMAGE:N] markers.
+    """
     lines = []
     for s in sections:
         if s["type"] == "heading":
             prefix = "#" * s.get("level", 2)
             lines.append(f"{prefix} {s['content']}")
+        elif s["type"] == "image_ref":
+            lines.append(f"[IMAGE:{s.get('index', 0)}]")
         else:
             lines.append(s["content"])
         lines.append("")
@@ -57,7 +62,10 @@ def sections_to_text(sections: list) -> str:
 
 
 def text_to_sections(text: str) -> list:
-    """Parse edited plain text back into a sections list."""
+    """Parse edited plain text back into a sections list.
+    [IMAGE:N] markers are converted back to image_ref nodes.
+    """
+    import re
     sections = []
     for line in text.splitlines():
         line = line.strip()
@@ -69,6 +77,9 @@ def text_to_sections(text: str) -> list:
             sections.append({"type": "heading", "level": 2, "content": line[3:]})
         elif line.startswith("# "):
             sections.append({"type": "heading", "level": 1, "content": line[2:]})
+        elif re.fullmatch(r"\[IMAGE:\d+\]", line):
+            idx = int(re.search(r"\d+", line).group())
+            sections.append({"type": "image_ref", "index": idx})
         else:
             sections.append({"type": "paragraph", "content": line})
     return sections
@@ -254,6 +265,21 @@ def step_configure():
             st.session_state.edit_mode = edit_mode
             st.session_state.edit_instructions = edit_instructions
 
+            # Step A — describe images with Pixtral (if any)
+            raw_urls = [u.strip() for u in st.session_state.image_urls.splitlines() if u.strip()]
+            image_descriptions = []
+            if raw_urls:
+                with st.spinner(f"Analyzing {len(raw_urls)} image(s) with vision model..."):
+                    try:
+                        from agents.image_agent import ImageAgent
+                        image_descriptions = ImageAgent().describe_images(raw_urls)
+                        st.session_state.image_descriptions = image_descriptions
+                        st.caption(f"Images analyzed: {len(image_descriptions)}")
+                    except Exception as e:
+                        st.warning(f"Image analysis failed, continuing without it: {e}")
+                        st.session_state.image_descriptions = []
+
+            # Step B — generate article (with image context if available)
             with st.spinner("Generating your Substack article..."):
                 try:
                     agent = ContentAgent()
@@ -261,6 +287,7 @@ def step_configure():
                         linkedin_text=st.session_state.linkedin_text,
                         tone=tone,
                         edit_instructions=edit_instructions if edit_mode else "",
+                        image_descriptions=image_descriptions or None,
                     )
                     st.session_state.generated_title = result.get("title", "")
                     st.session_state.generated_subtitle = result.get("subtitle", "")
@@ -309,6 +336,7 @@ def step_review():
                             linkedin_text=st.session_state.linkedin_text,
                             tone=regen_tone,
                             edit_instructions=regen_instructions,
+                            image_descriptions=st.session_state.image_descriptions or None,
                         )
                         st.session_state.generated_title = result.get("title", "")
                         st.session_state.generated_subtitle = result.get("subtitle", "")
@@ -321,7 +349,14 @@ def step_review():
     with col_preview:
         st.markdown("**Preview**")
         preview_sections = text_to_sections(body_text)
+        raw_image_urls = [
+            u.strip()
+            for u in st.session_state.image_urls.splitlines()
+            if u.strip()
+        ]
+
         body_html = ""
+        placed_preview = set()
         for s in preview_sections:
             if s["type"] == "heading":
                 lvl = s.get("level", 2)
@@ -329,6 +364,17 @@ def step_review():
                     f"<h{lvl} style='font-family:Georgia,serif;margin-top:1.2rem;color:#1a1a1a;'>"
                     f"{html_lib.escape(s['content'])}</h{lvl}>"
                 )
+            elif s["type"] == "image_ref":
+                idx = s.get("index", 0)
+                if idx < len(raw_image_urls):
+                    data_uri = _image_data_uri(raw_image_urls[idx])
+                    if data_uri:
+                        body_html += (
+                            f"<div style='margin:1.2rem 0;text-align:center;'>"
+                            f"<img src='{data_uri}' style='max-width:100%;border-radius:4px;'/>"
+                            f"</div>"
+                        )
+                        placed_preview.add(idx)
             else:
                 body_html += (
                     f"<p style='font-family:Georgia,serif;line-height:1.75;"
@@ -336,22 +382,16 @@ def step_review():
                     f"{html_lib.escape(s['content'])}</p>"
                 )
 
-        # Embed images as base64 data URIs — downloaded server-side with the
-        # correct Referer header so LinkedIn CDN doesn't block them.
-        images_html = ""
-        raw_image_urls = [
-            u.strip()
-            for u in st.session_state.image_urls.splitlines()
-            if u.strip()
-        ]
-        for img_url in raw_image_urls:
-            data_uri = _image_data_uri(img_url)
-            if data_uri:
-                images_html += (
-                    f"<div style='margin:1.2rem 0;text-align:center;'>"
-                    f"<img src='{data_uri}' style='max-width:100%;border-radius:4px;'/>"
-                    f"</div>"
-                )
+        # Append any images not yet placed inline
+        for idx, img_url in enumerate(raw_image_urls):
+            if idx not in placed_preview:
+                data_uri = _image_data_uri(img_url)
+                if data_uri:
+                    body_html += (
+                        f"<div style='margin:1.2rem 0;text-align:center;'>"
+                        f"<img src='{data_uri}' style='max-width:100%;border-radius:4px;'/>"
+                        f"</div>"
+                    )
 
         preview_html = f"""
         <html>
@@ -365,7 +405,6 @@ def step_review():
           </p>
           <hr style="border:none;border-top:1px solid #ddd;margin-bottom:1rem;"/>
           {body_html}
-          {images_html}
         </body>
         </html>
         """

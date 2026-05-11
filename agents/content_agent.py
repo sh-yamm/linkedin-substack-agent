@@ -13,9 +13,11 @@ def _normalise_sections(sections: list) -> list:
     normalised = []
     for item in sections:
         if isinstance(item, dict):
-            # Ensure required keys exist
             item.setdefault("type", "paragraph")
-            item.setdefault("content", "")
+            if item["type"] == "image_ref":
+                item.setdefault("index", 0)
+            else:
+                item.setdefault("content", "")
             normalised.append(item)
         elif isinstance(item, str) and item.strip():
             normalised.append({"type": "paragraph", "content": item.strip()})
@@ -28,7 +30,7 @@ class ContentAgent:
         self.client = Mistral(api_key=config.MISTRAL_API_KEY)
         self.model = config.MISTRAL_MODEL
 
-    def rewrite(self, linkedin_text: str, tone: str, edit_instructions: str = "") -> dict:
+    def rewrite(self, linkedin_text: str, tone: str, edit_instructions: str = "", image_descriptions: list = None) -> dict:
         """
         Rewrite a LinkedIn post into a structured Substack article.
 
@@ -54,8 +56,18 @@ Tone guidance: {tone_guidance}
         if edit_instructions.strip():
             user_content += f"\nAdditional instructions from the author: {edit_instructions.strip()}\n"
 
+        if image_descriptions:
+            user_content += "\n\nImages attached to this post:\n"
+            for img in image_descriptions:
+                user_content += f"- Image {img['index']}: {img['description']}\n"
+            user_content += (
+                "\nUse these descriptions to enrich the article with specific data and insights, "
+                "and place each image inline at its most relevant point using image_ref markers.\n"
+            )
+
         print(f"[agent] sending to Mistral | model={self.model} | tone={tone} | "
-              f"input_chars={len(linkedin_text)} | instructions={'yes' if edit_instructions.strip() else 'none'}")
+              f"input_chars={len(linkedin_text)} | instructions={'yes' if edit_instructions.strip() else 'none'} | "
+              f"images={len(image_descriptions) if image_descriptions else 0}")
 
         response = self.client.chat.complete(
             model=self.model,

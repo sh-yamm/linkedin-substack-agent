@@ -21,8 +21,14 @@ def _to_cdn_url(s3_url: str) -> str:
 
 
 def _build_prosemirror_body(sections: list, image_urls: list = None) -> dict:
-    """Convert a sections list into Substack's ProseMirror JSON document format."""
+    """Convert a sections list into Substack's ProseMirror JSON document format.
+
+    image_ref nodes in sections are placed inline at their declared index.
+    Any image indices not referenced by image_ref are appended at the end as a fallback.
+    """
+    image_urls = image_urls or []
     content = []
+    placed_indices = set()
 
     for section in sections:
         if section["type"] == "heading":
@@ -32,28 +38,29 @@ def _build_prosemirror_body(sections: list, image_urls: list = None) -> dict:
                 "attrs": {"level": level},
                 "content": [{"type": "text", "text": section["content"]}],
             })
+        elif section["type"] == "image_ref":
+            idx = section.get("index", 0)
+            if idx < len(image_urls):
+                content.append({
+                    "type": "paragraph",
+                    "content": [{"type": "image", "attrs": {"src": image_urls[idx], "alt": None, "title": None}}],
+                })
+                placed_indices.add(idx)
+            else:
+                print(f"[substack] image_ref index {idx} out of range (have {len(image_urls)} images) — skipped")
         else:
             content.append({
                 "type": "paragraph",
                 "content": [{"type": "text", "text": section["content"]}],
             })
 
-    if image_urls:
-        for url in image_urls:
-            # Standard TipTap/ProseMirror inline image wrapped in a paragraph.
-            # captionedImage is editor-only and is ignored by Substack's HTML renderer.
+    # Append any images that were not placed inline
+    for idx, url in enumerate(image_urls):
+        if idx not in placed_indices:
+            print(f"[substack] image {idx} not placed inline — appending at end")
             content.append({
                 "type": "paragraph",
-                "content": [
-                    {
-                        "type": "image",
-                        "attrs": {
-                            "src": url,
-                            "alt": None,
-                            "title": None,
-                        },
-                    }
-                ],
+                "content": [{"type": "image", "attrs": {"src": url, "alt": None, "title": None}}],
             })
 
     return {"type": "doc", "content": content}
